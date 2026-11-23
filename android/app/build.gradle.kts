@@ -59,7 +59,13 @@ android {
             // package the ffmpeg-kit native libs under the same JNI paths.
             // Keep the first copy merged (the app's direct dependency, the
             // full-gpl build) so subtitles keep working.
+            useLegacyPackaging = true
             pickFirsts += setOf(
+                "**/libggml.so",
+                "**/libggml-base.so",
+                "**/libggml-cpu.so",
+                "**/libggml-vulkan.so",
+                "**/libggml-opencl.so",
                 "**/libffmpegkit.so",
                 "**/libffmpegkit_abidetect.so",
                 "**/libavcodec.so",
