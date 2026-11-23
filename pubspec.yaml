@@ -44,7 +44,6 @@ dependencies:
   google_mlkit_face_detection: ^0.15.1
   ffmpeg_kit_flutter_new: ^4.6.2
   whisper_cpp_flutter_plus: ^0.4.0
-  llamadart: ^0.8.17
   shared_preferences: ^2.5.5
   share_plus: ^13.3.0
   path: ^1.9.0
