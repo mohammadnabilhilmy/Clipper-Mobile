@@ -232,7 +232,7 @@ class FFmpegService {
           RRect.fromRectAndRadius(rect, const Radius.circular(14)),
           bgPaint,
         );
-        paragraph.paint(canvas, Offset((targetW - textW) / 2.0, rect.top + 13));
+        canvas.drawParagraph(paragraph, Offset((targetW - textW) / 2.0, rect.top + 13));
 
         final img = await recorder.endRecording().toImage(targetW, targetH);
         final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
