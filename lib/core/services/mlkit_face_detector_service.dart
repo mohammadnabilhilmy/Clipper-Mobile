@@ -42,12 +42,10 @@ class MLKitFaceDetectorService {
   MLKitFaceDetectorService() {
     _faceDetector = FaceDetector(
       options: FaceDetectorOptions(
-        // Accurate mode is needed for mouth landmarks/contours, which let us
-        // tell WHO is talking at any moment (two speakers trading lines will
-        // alternate on screen instead of following a single largest face).
-        performanceMode: FaceDetectorMode.accurate,
+        performanceMode: FaceDetectorMode.fast,
+        minFaceSize: 0.02,
         enableLandmarks: true,
-        enableContours: true,
+        enableContours: false,
         enableClassification: false,
       ),
     );
