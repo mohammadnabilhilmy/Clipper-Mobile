@@ -1,3 +1,4 @@
+import 'dart:ui' as ui;
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -162,6 +163,89 @@ class FFmpegService {
     return srtFile;
   }
 
+  Future<List<({String path, double startSec, double endSec})>> _generateSubtitleOverlays(
+    VideoSegment segment,
+    SubtitleStyle style,
+    int targetW,
+    int targetH,
+  ) async {
+    final words = segment.transcript
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (words.isEmpty) return const [];
+
+    final tempDir = await getTemporaryDirectory();
+    final overlays = <({String path, double startSec, double endSec})>[];
+    final totalDur = max(1.0, segment.clipDuration.inMilliseconds / 1000.0);
+    const wordsPerLine = 4;
+    final timePerWord = totalDur / words.length;
+
+    for (int i = 0; i < words.length; i += wordsPerLine) {
+      final lineWords = words.sublist(i, min(i + wordsPerLine, words.length));
+      var text = lineWords.join(' ');
+      if (style.isUppercase) text = text.toUpperCase();
+
+      final startSec = i * timePerWord;
+      final endSec = min((i + wordsPerLine) * timePerWord, totalDur);
+
+      try {
+        final recorder = ui.PictureRecorder();
+        final canvas = Canvas(recorder);
+        final fontSize = (style.fontSize * (targetW / 420.0)).clamp(28.0, 64.0);
+
+        final pb = ui.ParagraphBuilder(
+          ui.ParagraphStyle(textAlign: ui.TextAlign.center, maxLines: 2),
+        )
+          ..pushStyle(
+            ui.TextStyle(
+              color: style.textColor,
+              fontSize: fontSize,
+              fontWeight: ui.FontWeight.bold,
+            ),
+          )
+          ..addText(text);
+
+        final paragraph = pb.build()
+          ..layout(ui.ParagraphConstraints(width: targetW * 0.86));
+
+        final textW = paragraph.maxIntrinsicWidth;
+        final textH = paragraph.height;
+        final yRatio = switch (style.position) {
+          SubtitlePosition.top => 0.15,
+          SubtitlePosition.center => 0.50,
+          SubtitlePosition.bottom => 0.78,
+        };
+
+        final rect = Rect.fromCenter(
+          center: Offset(targetW / 2.0, targetH * yRatio),
+          width: textW + 44,
+          height: textH + 26,
+        );
+
+        final bgPaint = Paint()
+          ..color = style.backgroundColor.withValues(alpha: 0.85)
+          ..style = PaintingStyle.fill;
+
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(rect, const Radius.circular(14)),
+          bgPaint,
+        );
+        paragraph.paint(canvas, Offset((targetW - textW) / 2.0, rect.top + 13));
+
+        final img = await recorder.endRecording().toImage(targetW, targetH);
+        final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData != null) {
+          final pngFile = File('${tempDir.path}/sub_ov_${segment.id}_$i.png');
+          await pngFile.writeAsBytes(byteData.buffer.asUint8List(), flush: true);
+          overlays.add((path: pngFile.path, startSec: startSec, endSec: endSec));
+        }
+      } catch (_) {}
+    }
+    return overlays;
+  }
+
   Future<List<String>> buildRenderCommand({
     required String inputPath,
     required String outputPath,
@@ -173,29 +257,19 @@ class FFmpegService {
     bool hasAudio = false,
   }) async {
     final startTimeStr = _formatTimestamp(segment.startTime);
-    final durationSec =
-        segment.clipDuration.inMilliseconds / 1000.0;
-
+    final durationSec = segment.clipDuration.inMilliseconds / 1000.0;
     final double targetAspectRatio = switch (segment.targetAspectRatio) {
       AspectRatioType.portrait916 => 9 / 16,
       AspectRatioType.square11 => 1.0,
       AspectRatioType.landscape169 => 16 / 9,
     };
 
-    String? subtitleFilter;
-    if (segment.enableSubtitles) {
-      final srtFile = await generateSrtFile(segment, subtitleStyle);
-      final forceStyle = _buildForceStyle(subtitleStyle);
-      final escapedSrtPath = srtFile.path
-          .replaceAll('\\', '/')
-          .replaceAll(':', '\\:')
-          .replaceAll(',', '\\,')
-          .replaceAll("'", "\\'");
-      subtitleFilter = "subtitles=$escapedSrtPath:force_style='$forceStyle'";
-      if (Platform.isAndroid) {
-        subtitleFilter += ':fontsdir=/system/fonts';
-      }
-    }
+    final outW = targetAspectRatio < 1.0 ? 720 : (targetAspectRatio == 1.0 ? 720 : 1280);
+    final outH = targetAspectRatio < 1.0 ? 1280 : 720;
+
+    final overlays = segment.enableSubtitles
+        ? await _generateSubtitleOverlays(segment, subtitleStyle, outW, outH)
+        : const <({String path, double startSec, double endSec})>[];
 
     final args = <String>[
       '-ss',
@@ -206,12 +280,15 @@ class FFmpegService {
       inputPath,
     ];
 
+    for (final ov in overlays) {
+      args.addAll(['-i', ov.path]);
+    }
+
+    var graph = '';
+    var currentLabel = '[vbase]';
+
     if (segment.faceKeyframes.isNotEmpty) {
-      // Dense keyframes: express the pan as split→trim→setpts→crop→concat so
-      // the filtergraph stays O(transitions) flat instead of nesting ~90-deep
-      // `if(lt(...))` expressions (which FFmpeg rejects). The graph is written
-      // to a script file because the string can exceed the argv size limit.
-      var graph = _cropFilterBuilder.generateChunkedFilterGraph(
+      graph = _cropFilterBuilder.generateChunkedFilterGraph(
         inputWidth: inputWidth,
         inputHeight: inputHeight,
         cropXPercent: cropXPercent,
@@ -219,39 +296,40 @@ class FFmpegService {
         segmentDurationSec: durationSec,
         keyframes: segment.faceKeyframes,
       );
-      var videoLabel = '[vout]';
-      if (subtitleFilter != null) {
-        graph += ';[vout]$subtitleFilter[vsub]';
-        videoLabel = '[vsub]';
-      }
-      if (hasAudio) {
-        graph += ';[0:a]atrim=start=0:end='
-            '${durationSec.toStringAsFixed(3)},asetpts=PTS-STARTPTS[aout]';
-      }
-
-      final tempDir = await getTemporaryDirectory();
-      final graphFile = File(
-        '${tempDir.path}/graph_${segment.id}_'
-        '${DateTime.now().millisecondsSinceEpoch}.fgr',
-      );
-      await graphFile.writeAsString(graph);
-
-      args.addAll(['-filter_complex_script', graphFile.path]);
-      args.addAll(['-map', videoLabel]);
-      if (hasAudio) args.addAll(['-map', '[aout]']);
+      graph += ';[vout]scale=$outW:$outH[vbase]';
     } else {
-      // No tracking data: static crop on the main video stream, FFmpeg picks
-      // the audio stream automatically.
       final cropFilter = _cropFilterBuilder.generateCropFilter(
         inputWidth: inputWidth,
         inputHeight: inputHeight,
         cropXPercent: cropXPercent,
         targetAspectRatio: targetAspectRatio,
       );
-      var filterComplex = cropFilter;
-      if (subtitleFilter != null) filterComplex += ',$subtitleFilter';
-      args.addAll(['-vf', filterComplex]);
+      graph = '[0:v]$cropFilter,scale=$outW:$outH[vbase]';
     }
+
+    for (int i = 0; i < overlays.length; i++) {
+      final ov = overlays[i];
+      final inputIdx = i + 1;
+      final nextLabel = '[vov$i]';
+      final s = ov.startSec.toStringAsFixed(2);
+      final e = ov.endSec.toStringAsFixed(2);
+      graph += ";$currentLabel[$inputIdx:v]overlay=0:0:enable='between(t,$s,$e)'$nextLabel";
+      currentLabel = nextLabel;
+    }
+
+    if (hasAudio) {
+      graph += ';[0:a]atrim=start=0:end=${durationSec.toStringAsFixed(3)},asetpts=PTS-STARTPTS[aout]';
+    }
+
+    final tempDir = await getTemporaryDirectory();
+    final graphFile = File(
+      '${tempDir.path}/graph_${segment.id}_${DateTime.now().millisecondsSinceEpoch}.fgr',
+    );
+    await graphFile.writeAsString(graph);
+
+    args.addAll(['-filter_complex_script', graphFile.path]);
+    args.addAll(['-map', currentLabel]);
+    if (hasAudio) args.addAll(['-map', '[aout]']);
 
     args.addAll([
       '-c:v',
